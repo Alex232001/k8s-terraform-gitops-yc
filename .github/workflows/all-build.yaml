@@ -1,0 +1,131 @@
+name: Build All Services
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, closed] 
+  workflow_dispatch:
+
+env:
+  REGISTRY: cr.yandex
+  #IMAGE_PREFIX: ghcr.io/alex232001
+  REGISTRY_ID: ${{ secrets.YC_REGISTRY_ID }}
+
+jobs:
+  build-services:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [
+          { name: emailservice, path: src/emailservice },
+          { name: productcatalogservice, path: src/productcatalogservice },
+          { name: recommendationservice, path: src/recommendationservice },
+          { name: shoppingassistantservice, path: src/shoppingassistantservice },
+          { name: shippingservice, path: src/shippingservice },
+          { name: checkoutservice, path: src/checkoutservice },
+          { name: paymentservice, path: src/paymentservice },
+          { name: currencyservice, path: src/currencyservice },
+          { name: cartservice, path: src/cartservice/src}, 
+          { name: frontend, path: src/frontend },
+          { name: adservice, path: src/adservice }
+        ]
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver: docker-container
+        buildkitd-flags: --debug
+    
+
+    - name: Build service ${{ matrix.service.name }}
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ matrix.service.path }}
+        file: ${{ matrix.service.path }}/Dockerfile
+        tags: |
+          ${{ matrix.service.name }}:latest
+          ${{ env.REGISTRY }}/${{ env.REGISTRY_ID }}/${{ matrix.service.name }}:latest
+          ${{ env.REGISTRY }}/${{ env.REGISTRY_ID }}/${{ matrix.service.name }}:${{ github.sha }}
+        cache-from: type=gha,scope=${{ github.ref }}-${{ matrix.service.name }}
+        cache-to: type=gha,mode=max,scope=${{ github.ref }}-${{ matrix.service.name }}
+        outputs: type=docker,dest=/tmp/${{ matrix.service.name }}.tar
+        load: true
+    
+    - name: Save ${{ matrix.service.name }} image as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.service.name }}-image
+        path: /tmp/${{ matrix.service.name }}.tar
+        retention-days: 30  
+
+  push-to-registry:
+    needs: build-services
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true }}
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to YCR with JSON Key
+      run: |
+        echo '${{ secrets.YC_JSON_KEY }}' | docker login \
+          --username json_key \
+          --password-stdin cr.yandex
+
+    #- name: Log in to Registry
+    #  uses: docker/login-action@v3
+    #  with:
+    #    registry: ${{ env.REGISTRY }}
+    #    username: ${{ github.actor }}
+    #    password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Download all images
+      uses: actions/download-artifact@v4
+      with:
+        path: /tmp/artifacts
+    
+    - name: Load Docker images
+      run: |
+        # Загружаем все скачанные образы
+        for artifact in /tmp/artifacts/*-image/*.tar; do
+          if [ -f "$artifact" ]; then
+            service_name=$(basename $artifact .tar)
+            echo "Loading image: $service_name"
+            docker load -i "$artifact"
+          fi
+        done
+
+        echo "Docker образы"
+        docker images
+    
+    - name: Push all images to Yandex Cloud
+      run: |
+        SERVICES="emailservice productcatalogservice recommendationservice shoppingassistantservice
+        shippingservice checkoutservice paymentservice currencyservice cartservice frontend adservice"
+        
+        for service in $SERVICES; do
+          echo "Pushing $service to Yandex Cloud"
+          
+          docker tag $service ${{ env.REGISTRY }}/${{ env.REGISTRY_ID }}/$service:latest
+          docker tag $service ${{ env.REGISTRY }}/${{ env.REGISTRY_ID }}/$service:${{ github.sha }}
+          
+          docker push ${{ env.REGISTRY }}/${{ env.REGISTRY_ID }}/$service:latest
+          docker push ${{ env.REGISTRY }}/${{ env.REGISTRY_ID }}/$service:${{ github.sha }}
+          
+          echo "$service pushed successfully"
+        done
