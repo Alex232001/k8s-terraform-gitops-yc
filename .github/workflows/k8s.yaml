@@ -1,0 +1,206 @@
+name: Terraform Deploy k8s
+
+on:
+  #pull_request:
+  #  branches: [ main]
+  workflow_dispatch: 
+
+env:
+  # Yandex Cloud Secrets
+  YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+  YC_REGISTRY_ID: ${{ secrets.YC_REGISTRY_ID }}
+  YC_ACCESS_KEY: ${{ secrets.YC_ACCESS_KEY }}
+  YC_SECRET_KEY: ${{ secrets.YC_SECRET_KEY }}
+  
+  # Terraform Variables
+  TF_VAR_folder_id: ${{ secrets.YC_FOLDER_ID }}
+  TF_VAR_registry_id: ${{ secrets.YC_REGISTRY_ID }}
+  TF_VAR_yc_access_key: ${{ secrets.YC_ACCESS_KEY }}
+  TF_VAR_yc_secret_key: ${{ secrets.YC_SECRET_KEY }}
+  
+  AWS_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_KEY }}
+  
+  # Work directory
+  TF_K8S_DIR: "Terraform/k8s"
+  TF_APPLICATION_DIR: "Terraform/application"
+
+
+
+jobs:
+  terraform-deploy:
+    runs-on: ubuntu-latest
+    #if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.11.0
+
+    - name: Install kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+        kubectl version --client
+    
+    - name: Install Helm
+      run: |
+        curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        chmod 700 get_helm.sh
+        ./get_helm.sh
+        helm version
+
+    - name: Install envsubst
+      run: sudo apt-get update && sudo apt-get install -y gettext-base
+ 
+    - name: Install YC CLI
+      run: |
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -n -i /home/runner/yc
+          echo "/home/runner/yc/bin" >> $GITHUB_PATH
+          chmod +x /home/runner/yc/bin/yc
+           
+    - name: Yc test
+      working-directory: ${{ env.TF_K8S_DIR}} 
+      run: |
+        yc --version
+
+        echo '${{ secrets.YC_SERVICE_ACCOUNT_KEY_JSON }}' > sa-key.json
+        chmod 600 sa-key.json
+
+        yc config profile create github-actions
+        yc config set service-account-key sa-key.json
+        yc config set folder-id  ${{ secrets.YC_FOLDER_ID }}
+
+        yc config profile list
+ 
+    - name: Verify installations
+      run: |
+        echo "=== Tool Versions ==="
+        kubectl version --client
+        echo "---"
+        helm version
+        echo "---"
+        yc --version
+
+    - name: Terraform Init k8s
+      working-directory: ${{ env.TF_K8S_DIR}} 
+      run: |
+        terraform init \
+          -backend-config="access_key=${{ secrets.YC_ACCESS_KEY }}" \
+          -backend-config="secret_key=${{ secrets.YC_SECRET_KEY }}"
+
+    - name: Check and import DNS zone
+      working-directory: ${{ env.TF_K8S_DIR}} 
+      run: |
+        # Проверяем существование зоны
+        if yc dns zone list --format json | jq -e '.[] | select(.name=="stellarclaw-zone")' > /dev/null 2>&1; then
+          echo "DNS zone importing"
+          ZONE_ID=$(yc dns zone get --name stellarclaw-zone --format json | jq -r '.id')
+          terraform import yandex_dns_zone.stellarclaw_zone $ZONE_ID || echo "Zone already managed or import failed"
+        else
+          echo "DNS zone does not exist, will be created"
+        fi
+
+    - name: Terraform Plan k8s
+      working-directory: ${{ env.TF_K8S_DIR}} 
+      run: terraform plan    
+
+    - name: Terraform Apply k8s
+      working-directory: ${{ env.TF_K8S_DIR}} 
+      run: terraform apply -auto-approve   
+
+    - name: Connections kubectl 
+      working-directory: ${{ env.TF_K8S_DIR}} 
+      run: |
+        export CLUSTER_ID=$(terraform output -raw cluster_id)
+        export SA_KEY=$(terraform output -raw service_account_key_json_k8s_dns)
+
+        yc managed-kubernetes cluster get-credentials --id $CLUSTER_ID --external --force
+
+        cat > external-dns-values.yaml << EOF
+        config:
+          auth:
+            json: '${SA_KEY}'
+          folder_id: "${{ secrets.YC_FOLDER_ID }}"
+          txt_owner_id: "stellarclaw-k8s"
+          txt_prefix: "extdns"
+
+        image:
+          repository: cr.yandex/yc-marketplace/yandex-cloud/externaldns/externaldns1740381704064773431763120350102291379936788013545
+          tag: 0.5.1
+          pullPolicy: Always
+        EOF
+
+    - name: Setup helm repo
+      working-directory: ${{ env.TF_K8S_DIR}} 
+      run: |
+        # Добавляем все необходимые репозитории
+        helm repo add argo https://argoproj.github.io/argo-helm
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo add jetstack https://charts.jetstack.io
+        
+        # Обновляем информацию о репозиториях
+        helm repo update
+        
+        #helm pull oci://cr.yandex/yc-marketplace/yandex-cloud/externaldns/chart/externaldns --version 0.5.1-b
+
+        #tar -xzf externaldns-*.tgz
+
+        # Выполняем установку/обновление чартов
+
+        helm upgrade --install external-dns \
+          oci://cr.yandex/yc-marketplace/yandex-cloud/externaldns/chart/externaldns \
+          --version 0.5.1-b \
+          -n externaldns-space \
+          --create-namespace \
+          -f external-dns-values.yaml \
+          --wait \
+          --timeout 10m
+        
+        # Ingress Nginx
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+          --namespace ingress-nginx \
+          --create-namespace \
+          --set controller.service.type=LoadBalancer
+        
+        # Cert Manager
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager \
+          --create-namespace \
+          --version v1.13.0 \
+          --set installCRDs=true \
+          --wait \
+          --timeout 10m
+
+        kubectl apply -f cert-manager.yaml
+
+
+        # ArgoCD (зависит от ingress и cert-manager)
+        helm upgrade --install argocd argo/argo-cd \
+          --namespace argocd \
+          --create-namespace \
+          --set global.domain=argocd.stellarclaw.ru \
+          --set server.ingress.enabled=true \
+          --set server.ingress.ingressClassName=nginx \
+          --set server.ingress.hosts[0]=argocd.stellarclaw.ru \
+          --set server.ingress.tls[0].hosts[0]=argocd.stellarclaw.ru \
+          --set server.ingress.tls[0].secretName=argocd-server-tls \
+          --set server.ingress.annotations."cert-manager\.io/cluster-issuer"=letsencrypt-dev \
+          --set server.ingress.annotations."nginx\.ingress\.kubernetes\.io/ssl-passthrough"=true \
+          --set server.ingress.annotations."nginx\.ingress\.kubernetes\.io/backend-protocol"=HTTPS \
+          --set server.ingress.annotations."external-dns\.alpha\.kubernetes\.io/hostname"=argocd.stellarclaw.ru \
+          --set server.ingress.annotations."external-dns\.alpha\.kubernetes\.io/ttl"=300 \
+          --wait \
+          --timeout 15m
+
+    - name: Deploy apps
+      working-directory: ${{ env.TF_APPLICATION_DIR}}
+      run: |
+        envsubst < app-template.yaml > app.yaml
+        kubectl apply -f app.yaml
+      env:
+        REGISTRY_URL: ${{ secrets.YC_REGISTRY_URL }}

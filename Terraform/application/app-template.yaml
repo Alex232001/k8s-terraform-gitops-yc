@@ -1,0 +1,73 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-online-store  # Соответствует имени релиза Helm
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/Alex232001/microservice_demo_g2.git
+    targetRevision: main
+    path: helm-chart
+    
+    helm:
+      valueFiles:
+        - values.yaml
+      releaseName: my-online-store
+
+      parameters:
+        - name: images.repository
+          value: "${REGISTRY_URL}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: stellarclaw
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true  
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-web-app
+  namespace: argocd
+spec:
+  project: default
+  
+  source:
+    repoURL: https://github.com/Alex232001/argo-apps.git
+    targetRevision: main
+    path: apps/my-web/  
+  
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: my-web-apps
+  
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+    - CreateNamespace=true
+    - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
